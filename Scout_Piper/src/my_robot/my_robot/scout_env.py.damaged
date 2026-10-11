@@ -1,0 +1,140 @@
+import time
+import random
+import threading
+import subprocess
+import re
+
+import gymnasium as gym
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+
+from geometry_msgs.msg import Twist
+import sys
+sys.path.append("/usr/lib/python3/dist-packages")
+
+import gz.transport13 as gz_transport
+from gz.msgs10.pose_v_pb2 import Pose_V
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Float32MultiArray, Bool
+
+
+# ============================================================
+# ROS INTERFACE
+# ============================================================
+
+class ScoutROSNode(Node):
+
+    def __init__(self):
+
+        super().__init__('scout_rl_interface')
+
+        self.depth_sectors = None
+
+        self.robot_x = 0.0
+        self.robot_y = 0.0
+        self.robot_yaw = 0.0
+
+        self.ground_truth_process = None
+
+        self.bottle_visible = False
+        self.perception_updated = False
+
+        self.linear_velocity = 0.0
+        self.angular_velocity = 0.0
+
+        # ----------------------------------------------------
+        # Subscribers
+        # ----------------------------------------------------
+
+        self.create_subscription(
+            Float32MultiArray,
+            '/depth_sectors',
+            self.depth_callback,
+            10
+        )
+
+        self.create_subscription(
+            Float32MultiArray,
+            '/bottle_target',
+            self.target_callback,
+            10
+        )
+
+        self.create_subscription(
+            Bool,
+            '/bottle_target_valid',
+            self.target_valid_callback,
+            10
+        )
+
+        # ----------------------------------------------------
+        # Velocity publisher
+        # ----------------------------------------------------
+
+        self.cmd_pub = self.create_publisher(
+            Twist,
+            '/cmd_vel',
+            10
+        )
+
+        self.gz_node = gz_transport.Node()
+        self.gz_node.subscribe(
+            Pose_V,
+            '/world/scout_world/dynamic_pose/info',
+            self.gazebo_pose_callback
+        )
+
+        self.get_logger().info(
+            'Scout RL interface started'
+        )
+
+    # --------------------------------------------------------
+    # Callbacks
+    # --------------------------------------------------------
+
+    def depth_callback(self, msg):
+
+        if len(msg.data) != 20:
+            return
+
+        self.depth_sectors = np.array(
+            msg.data,
+            dtype=np.float32
+        )
+
+
+
+
+    def gazebo_pose_callback(self, msg):
+        """Update Scout world pose directly from Gazebo Transport."""
+
+        for pose in msg.pose:
+
+            if pose.name != "scout_piper":
+                continue
+
+            self.robot_x = pose.position.x
+            self.robot_y = pose.position.y
+
+            q = pose.orientation
+
+            sin_yaw = 2.0 * (
+                q.w * q.z +
+                q.x * q.y
+            )
+
+            cos_yaw = 1.0 - 2.0 * (
+                q.y * q.y +
+                q.z * q.z
+            )
+
+            self.robot_yaw = np.arctan2(
+                sin_yaw,
+                cos_yaw
+            )
+
+            return
+

@@ -1,0 +1,950 @@
+import time
+import threading
+import subprocess
+
+import gymnasium as gym
+import numpy as np
+
+import rclpy
+from rclpy.node import Node
+from rclpy.executors import SingleThreadedExecutor
+
+from geometry_msgs.msg import Twist
+from nav_msgs.msg import Odometry
+from std_msgs.msg import Float32MultiArray
+
+
+# ============================================================
+# ROS INTERFACE
+# ============================================================
+
+class ScoutROSNode(Node):
+
+    def __init__(self):
+
+        super().__init__('scout_rl_interface')
+
+        self.depth_sectors = None
+        self.bottle_target = None
+
+        self.linear_velocity = 0.0
+        self.angular_velocity = 0.0
+
+        # ----------------------------------------------------
+        # Subscribers
+        # ----------------------------------------------------
+
+        self.create_subscription(
+            Float32MultiArray,
+            '/depth_sectors',
+            self.depth_callback,
+            10
+        )
+
+        self.create_subscription(
+            Float32MultiArray,
+            '/bottle_target',
+            self.target_callback,
+            10
+        )
+
+        self.create_subscription(
+            Odometry,
+            '/odom',
+            self.odom_callback,
+            10
+        )
+
+        # ----------------------------------------------------
+        # Velocity publisher
+        # ----------------------------------------------------
+
+        self.cmd_pub = self.create_publisher(
+            Twist,
+            '/cmd_vel',
+            10
+        )
+
+        self.get_logger().info(
+            'Scout RL interface started'
+        )
+
+    # --------------------------------------------------------
+    # Callbacks
+    # --------------------------------------------------------
+
+    def depth_callback(self, msg):
+
+        if len(msg.data) != 20:
+            return
+
+        self.depth_sectors = np.array(
+            msg.data,
+            dtype=np.float32
+        )
+
+    def target_callback(self, msg):
+
+        if len(msg.data) < 2:
+            return
+
+        self.bottle_target = np.array(
+            msg.data[:2],
+            dtype=np.float32
+        )
+
+    def odom_callback(self, msg):
+
+        self.linear_velocity = float(
+            msg.twist.twist.linear.x
+        )
+
+        self.angular_velocity = float(
+            msg.twist.twist.angular.z
+        )
+
+    # --------------------------------------------------------
+    # Robot control
+    # --------------------------------------------------------
+
+    def send_action(
+        self,
+        linear_velocity,
+        angular_velocity
+    ):
+
+        cmd = Twist()
+
+        cmd.linear.x = float(
+            linear_velocity
+        )
+
+        cmd.angular.z = float(
+            angular_velocity
+        )
+
+        self.cmd_pub.publish(cmd)
+
+    def stop_robot(self):
+
+        self.send_action(
+            0.0,
+            0.0
+        )
+
+
+# ============================================================
+# GYMNASIUM ENVIRONMENT
+# ============================================================
+
+class ScoutEnv(gym.Env):
+
+    metadata = {
+        'render_modes': []
+    }
+
+    def __init__(self):
+
+        super().__init__()
+
+        # ----------------------------------------------------
+        # ROS initialization
+        # ----------------------------------------------------
+
+        if not rclpy.ok():
+            rclpy.init()
+
+        self.ros_node = ScoutROSNode()
+
+        self.executor = SingleThreadedExecutor()
+
+        self.executor.add_node(
+            self.ros_node
+        )
+
+        self.executor_thread = threading.Thread(
+            target=self.executor.spin,
+            daemon=True
+        )
+
+        self.executor_thread.start()
+
+        # ====================================================
+        # OBSERVATION SPACE
+        #
+        # 0 - 19 : depth sectors
+        # 20     : goal distance
+        # 21     : goal angle
+        # 22     : linear velocity
+        # 23     : angular velocity
+        #
+        # Total = 24
+        # ====================================================
+
+        low = np.array(
+            [0.0] * 20
+            + [
+                0.0,
+                -np.pi,
+                -1.0,
+                -3.0
+            ],
+            dtype=np.float32
+        )
+
+        high = np.array(
+            [8.0] * 20
+            + [
+                8.0,
+                np.pi,
+                1.0,
+                3.0
+            ],
+            dtype=np.float32
+        )
+
+        self.observation_space = gym.spaces.Box(
+            low=low,
+            high=high,
+            dtype=np.float32
+        )
+
+        # ====================================================
+        # ACTION SPACE
+        #
+        # action[0] = linear velocity
+        # action[1] = angular velocity
+        # ====================================================
+
+        self.action_space = gym.spaces.Box(
+            low=np.array(
+                [
+                    0.0,
+                    -1.0
+                ],
+                dtype=np.float32
+            ),
+            high=np.array(
+                [
+                    0.5,
+                    1.0
+                ],
+                dtype=np.float32
+            ),
+            dtype=np.float32
+        )
+
+        # ====================================================
+        # NAVIGATION PARAMETERS
+        # ====================================================
+
+        self.goal_threshold = 0.70
+
+        self.collision_threshold = 0.25
+
+        # ====================================================
+        # REWARD PARAMETERS
+        # ====================================================
+
+        self.progress_weight = 20.0
+
+        self.goal_reward = 150.0
+
+        self.collision_penalty = 100.0
+
+        self.time_penalty = 0.02
+
+        # ----------------------------------------------------
+        # Energy optimization
+        # ----------------------------------------------------
+
+        self.linear_energy_weight = 0.01
+
+        self.angular_energy_weight = 0.005
+
+        # ----------------------------------------------------
+        # Smoothness
+        # ----------------------------------------------------
+
+        self.smoothness_weight = 0.005
+
+        # ====================================================
+        # EPISODE STATE
+        # ====================================================
+
+        self.previous_goal_distance = None
+
+        self.previous_action = np.zeros(
+            2,
+            dtype=np.float32
+        )
+
+        self.max_steps = 500
+
+        self.current_step = 0
+
+        self.closed = False
+
+        # Maximum amount of time reset() waits for sensors
+        self.sensor_timeout = 10.0
+
+    # ========================================================
+    # WAIT FOR REAL SENSOR DATA
+    # ========================================================
+
+    def _wait_for_sensor_data(self):
+
+        start_time = time.time()
+
+        while True:
+
+            depth_ready = (
+                self.ros_node.depth_sectors
+                is not None
+            )
+
+            target_ready = (
+                self.ros_node.bottle_target
+                is not None
+            )
+
+            if depth_ready and target_ready:
+                return True
+
+            if (
+                time.time()
+                - start_time
+                > self.sensor_timeout
+            ):
+
+                return False
+
+            time.sleep(0.05)
+
+    # ========================================================
+    # GET OBSERVATION
+    # ========================================================
+
+    def _get_observation(self):
+
+        depth = self.ros_node.depth_sectors
+
+        target = self.ros_node.bottle_target
+
+        # ----------------------------------------------------
+        # Fallback values
+        #
+        # These are retained as a safety mechanism.
+        # reset() will NOT intentionally begin an episode
+        # using them.
+        # ----------------------------------------------------
+
+        if depth is None:
+
+            depth = np.full(
+                20,
+                8.0,
+                dtype=np.float32
+            )
+
+        if target is None:
+
+            target = np.array(
+                [
+                    8.0,
+                    0.0
+                ],
+                dtype=np.float32
+            )
+
+        observation = np.concatenate(
+            [
+                depth,
+
+                target,
+
+                np.array(
+                    [
+                        self.ros_node.linear_velocity,
+                        self.ros_node.angular_velocity
+                    ],
+                    dtype=np.float32
+                )
+            ]
+        )
+
+        observation = np.clip(
+            observation,
+            self.observation_space.low,
+            self.observation_space.high
+        )
+
+        return observation.astype(
+            np.float32
+        )
+
+    # ========================================================
+    # GAZEBO RESET
+    # ========================================================
+
+    def _run_gz_service(self, command):
+
+        result = subprocess.run(
+            command,
+            capture_output=True,
+            text=True,
+            timeout=6
+        )
+
+        if result.returncode != 0:
+            raise RuntimeError(
+                "Gazebo service failed:\n"
+                + result.stderr
+            )
+
+        return result
+
+
+    def _reset_simulation(self):
+
+        # ----------------------------------------------------
+        # Stop Scout
+        # ----------------------------------------------------
+
+        self.ros_node.stop_robot()
+        time.sleep(0.2)
+
+        # ----------------------------------------------------
+        # Reset Scout to (0, 0)
+        # ----------------------------------------------------
+
+        scout_command = [
+            "gz", "service",
+            "-s", "/world/scout_world/set_pose",
+            "--reqtype", "gz.msgs.Pose",
+            "--reptype", "gz.msgs.Boolean",
+            "--timeout", "5000",
+            "--req",
+            'name: "scout_piper", '
+            'position: {x: 0.0, y: 0.0, z: 0.18}, '
+            'orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}'
+        ]
+
+        self._run_gz_service(
+            scout_command
+        )
+
+        # ----------------------------------------------------
+        # Reset existing bottle to (2, 0)
+        # DO NOT remove/recreate it between PPO episodes.
+        # ----------------------------------------------------
+
+        bottle_command = [
+            "gz", "service",
+            "-s", "/world/scout_world/set_pose",
+            "--reqtype", "gz.msgs.Pose",
+            "--reptype", "gz.msgs.Boolean",
+            "--timeout", "5000",
+            "--req",
+            'name: "bottle", '
+            'position: {x: 2.0, y: 0.0, z: 0.001}, '
+            'orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}'
+        ]
+
+        self._run_gz_service(
+            bottle_command
+        )
+
+        # ----------------------------------------------------
+        # Discard observations from previous episode
+        # ----------------------------------------------------
+
+        self.ros_node.depth_sectors = None
+        self.ros_node.bottle_target = None
+
+        # Allow Gazebo camera and perception nodes to update
+        time.sleep(1.0)
+
+
+    # ========================================================
+    # RESET
+    # ========================================================
+
+    def reset(
+        self,
+        seed=None,
+        options=None
+    ):
+
+        super().reset(seed=seed)
+
+        # ----------------------------------------------------
+        # Stop Scout
+        # ----------------------------------------------------
+
+        self.ros_node.stop_robot()
+        time.sleep(0.2)
+
+        # ----------------------------------------------------
+        # Reset Scout to its ORIGINAL Gazebo spawn pose
+        # ----------------------------------------------------
+
+        scout_command = [
+            "gz", "service",
+            "-s", "/world/scout_world/set_pose",
+            "--reqtype", "gz.msgs.Pose",
+            "--reptype", "gz.msgs.Boolean",
+            "--timeout", "5000",
+            "--req",
+            'name: "scout_piper", '
+            'position: {x: 0.0, y: 0.0, z: 0.18}, '
+            'orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}'
+        ]
+
+        self._run_gz_service(
+            scout_command
+        )
+
+        time.sleep(0.5)
+
+        # ----------------------------------------------------
+        # Reset / spawn bottle
+        # ----------------------------------------------------
+
+        # Remove any previous bottle.
+        bottle_remove = [
+            "gz", "service",
+            "-s", "/world/scout_world/remove",
+            "--reqtype", "gz.msgs.Entity",
+            "--reptype", "gz.msgs.Boolean",
+            "--timeout", "5000",
+            "--req",
+            'name: "bottle", type: MODEL'
+        ]
+
+        try:
+            self._run_gz_service(bottle_remove)
+        except RuntimeError:
+            pass
+
+        time.sleep(0.2)
+
+        # Always create a fresh bottle at the reset position.
+        bottle_create = [
+            "gz", "service",
+            "-s", "/world/scout_world/create",
+            "--reqtype", "gz.msgs.EntityFactory",
+            "--reptype", "gz.msgs.Boolean",
+            "--timeout", "5000",
+            "--req",
+            'sdf_filename: "/home/kowshik0714/ros2_ws/src/my_robot/models/bottle/model.sdf", '
+            'pose: {position: {x: 2.0, y: 0.0, z: 0.001}, '
+            'orientation: {w: 1.0, x: 0.0, y: 0.0, z: 0.0}}'
+        ]
+
+        self._run_gz_service(bottle_create)
+        time.sleep(0.5)
+
+        # Stabilize robot after Gazebo teleport
+        # ----------------------------------------------------
+
+        # Ensure DiffDrive receives a zero-velocity command
+        # after the model has been teleported.
+        self.ros_node.stop_robot()
+
+        # Allow wheel contacts, gravity, camera and bottle
+        # physics to settle before accepting observations.
+        time.sleep(2.0)
+
+        # ----------------------------------------------------
+        # Discard all observations generated during reset
+        # ----------------------------------------------------
+
+        self.ros_node.depth_sectors = None
+        self.ros_node.bottle_target = None
+
+        # Reset episode variables
+        self.current_step = 0
+
+        self.previous_action = np.zeros(
+            2,
+            dtype=np.float32
+        )
+
+        self.previous_goal_distance = None
+
+        # Wait for fresh observations
+        sensor_ready = False
+
+        for attempt in range(3):
+
+            sensor_ready = self._wait_for_sensor_data()
+
+            if sensor_ready:
+                break
+
+            print(
+                f"[RESET] Sensor retry {attempt + 1}/3: "
+                "waiting for fresh bottle/depth data..."
+            )
+
+            self.ros_node.stop_robot()
+
+            time.sleep(2.0)
+
+            self.ros_node.depth_sectors = None
+            self.ros_node.bottle_target = None
+
+        if not sensor_ready:
+            raise RuntimeError(
+                "ScoutEnv reset failed after 3 attempts: "
+                "did not receive fresh /depth_sectors "
+                "and /bottle_target."
+            )
+
+        observation = self._get_observation()
+
+        self.previous_goal_distance = float(
+            observation[20]
+        )
+
+        info = {
+            "goal_distance": self.previous_goal_distance,
+            "sensor_ready": True
+        }
+
+        return observation, info
+
+
+    # ========================================================
+    # STEP
+    # ========================================================
+
+    def step(self, action):
+
+        # ----------------------------------------------------
+        # Restrict action
+        # ----------------------------------------------------
+
+        action = np.clip(
+            action,
+            self.action_space.low,
+            self.action_space.high
+        )
+
+        linear_velocity = float(
+            action[0]
+        )
+
+        angular_velocity = float(
+            action[1]
+        )
+
+        # ----------------------------------------------------
+        # Send action
+        # ----------------------------------------------------
+
+        self.ros_node.send_action(
+            linear_velocity,
+            angular_velocity
+        )
+
+        # Allow Gazebo / sensors to update
+        time.sleep(0.1)
+
+        # ----------------------------------------------------
+        # New observation
+        # ----------------------------------------------------
+
+        observation = (
+            self._get_observation()
+        )
+
+        goal_distance = float(
+            observation[20]
+        )
+
+        min_obstacle = float(
+            np.min(
+                observation[:20]
+            )
+        )
+
+        # ====================================================
+        # REWARD
+        # ====================================================
+
+        reward = 0.0
+
+        # ----------------------------------------------------
+        # Progress reward
+        # ----------------------------------------------------
+
+        if self.previous_goal_distance is None:
+
+            progress = 0.0
+
+        else:
+
+            progress = (
+                self.previous_goal_distance
+                - goal_distance
+            )
+
+        reward += (
+            self.progress_weight
+            * progress
+        )
+
+        # ----------------------------------------------------
+        # Time penalty
+        # ----------------------------------------------------
+
+        reward -= (
+            self.time_penalty
+        )
+
+        # ----------------------------------------------------
+        # Energy penalty
+        # ----------------------------------------------------
+
+        energy_penalty = (
+            self.linear_energy_weight
+            * linear_velocity ** 2
+            +
+            self.angular_energy_weight
+            * angular_velocity ** 2
+        )
+
+        reward -= (
+            energy_penalty
+        )
+
+        # ----------------------------------------------------
+        # Smoothness penalty
+        # ----------------------------------------------------
+
+        action_change = (
+            action
+            - self.previous_action
+        )
+
+        smoothness_penalty = (
+            self.smoothness_weight
+            * float(
+                np.sum(
+                    action_change ** 2
+                )
+            )
+        )
+
+        reward -= (
+            smoothness_penalty
+        )
+
+        # ====================================================
+        print(
+            f"[RL] action=({linear_velocity:.3f}, {angular_velocity:.3f}) "
+            f"distance={goal_distance:.3f} "
+            f"progress={progress:.4f} "
+            f"reward={reward:.4f}"
+        )
+
+        # TERMINATION
+        # ====================================================
+
+        terminated = False
+
+        goal_reached = False
+
+        collision = False
+
+        # ----------------------------------------------------
+        # Goal reached
+        # ----------------------------------------------------
+
+        if (
+            goal_distance
+            <= self.goal_threshold
+        ):
+
+            reward += (
+                self.goal_reward
+            )
+
+            goal_reached = True
+
+            # Stop Scout immediately at the bottle stand-off distance
+            self.ros_node.stop_robot()
+
+            terminated = True
+
+        # ----------------------------------------------------
+        # Collision
+        # ----------------------------------------------------
+
+        if (
+            min_obstacle
+            <= self.collision_threshold
+        ):
+
+            reward -= (
+                self.collision_penalty
+            )
+
+            collision = True
+
+            terminated = True
+
+        # ----------------------------------------------------
+        # Update state
+        # ----------------------------------------------------
+
+        self.previous_goal_distance = (
+            goal_distance
+        )
+
+        self.previous_action = np.array(
+            action,
+            dtype=np.float32
+        )
+
+        self.current_step += 1
+
+        truncated = (
+            self.current_step
+            >= self.max_steps
+        )
+
+        # ----------------------------------------------------
+        # Information
+        # ----------------------------------------------------
+
+        info = {
+
+            'goal_distance':
+                goal_distance,
+
+            'min_obstacle':
+                min_obstacle,
+
+            'progress':
+                progress,
+
+            'energy_penalty':
+                energy_penalty,
+
+            'smoothness_penalty':
+                smoothness_penalty,
+
+            'goal_reached':
+                goal_reached,
+
+            'collision':
+                collision,
+
+            'step':
+                self.current_step
+        }
+
+        return (
+            observation,
+            float(reward),
+            terminated,
+            truncated,
+            info
+        )
+
+    # ========================================================
+    # CLOSE
+    # ========================================================
+
+    def close(self):
+
+        if self.closed:
+            return
+
+        self.closed = True
+
+        # ----------------------------------------------------
+        # Stop Scout
+        # ----------------------------------------------------
+
+        try:
+
+            self.ros_node.stop_robot()
+
+            time.sleep(0.1)
+
+        except Exception:
+
+            pass
+
+        # ----------------------------------------------------
+        # Stop executor
+        # ----------------------------------------------------
+
+        try:
+
+            self.executor.shutdown(
+                timeout_sec=1.0
+            )
+
+        except Exception:
+
+            pass
+
+        # ----------------------------------------------------
+        # Wait for executor thread
+        # ----------------------------------------------------
+
+        if (
+            self.executor_thread
+            is not None
+            and
+            self.executor_thread.is_alive()
+        ):
+
+            self.executor_thread.join(
+                timeout=2.0
+            )
+
+        # ----------------------------------------------------
+        # Remove ROS node
+        # ----------------------------------------------------
+
+        try:
+
+            self.executor.remove_node(
+                self.ros_node
+            )
+
+        except Exception:
+
+            pass
+
+        # ----------------------------------------------------
+        # Destroy ROS node
+        # ----------------------------------------------------
+
+        try:
+
+            self.ros_node.destroy_node()
+
+        except Exception:
+
+            pass
+
+        # ----------------------------------------------------
+        # Shutdown ROS
+        # ----------------------------------------------------
+
+        if rclpy.ok():
+
+            try:
+
+                rclpy.shutdown()
+
+            except Exception:
+
+                pass
